@@ -1,1 +1,4 @@
-Existing Azure workflow: ⚠️ still contains AZURE_WEBAPP_NAME
+Problem 1 — Azure placeholder: AZURE_WEBAPP_NAME is still your-app-name, so this workflow is not ready to deploy.
+Problem 2 — wrong deployment target: This workflow deploys to Azure, not your IBM Code Engine bigkain-ibm-backend.
+Problem 3 — permissions: It currently requests only contents: read for the build job. That is not the same as the GitHub Actions/workflow write permission you were trying to configure.
+Problem 4 — dependency file: I couldn't find package.json at the repository root on that branch, so the npm install step may fail unless the Node project is in another directory.
