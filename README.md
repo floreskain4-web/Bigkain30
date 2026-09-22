@@ -1,5 +1,5 @@
 permissions:
-  contents: write
-  pull-requests: write
-  actions: read
-  checks: read
+  contents: write/read
+  pull-requests: write/read
+  actions: read/write
+  checks: read/write
