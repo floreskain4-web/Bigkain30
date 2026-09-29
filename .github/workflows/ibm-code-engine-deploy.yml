@@ -1,0 +1,160 @@
+name: Deploy backend to IBM Code Engine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-engine-backend-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IBM_CE_REGION: ${{ vars.IBM_CE_REGION }}
+      IBM_CE_PROJECT: ${{ vars.IBM_CE_PROJECT }}
+      IBM_CE_SOURCE_DIR: ${{ vars.IBM_CE_SOURCE_DIR || '.' }}
+      IBM_CE_PORT: ${{ vars.IBM_CE_PORT }}
+      IBM_CE_VISIBILITY: ${{ vars.IBM_CE_VISIBILITY }}
+      IBM_CE_HEALTH_PATH: ${{ vars.IBM_CE_HEALTH_PATH || '/' }}
+      IBM_CE_APP_NAME: bigkain-ibm-backend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate deployment configuration and source
+        env:
+          IBM_CLOUD_API_KEY: ${{ secrets.IBM_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          for required in IBM_CLOUD_API_KEY IBM_CE_REGION IBM_CE_PROJECT IBM_CE_VISIBILITY; do
+            if [[ -z "${!required}" ]]; then
+              echo "::error::Required GitHub secret/variable $required is not configured. See README.md."
+              exit 1
+            fi
+          done
+
+          case "$IBM_CE_SOURCE_DIR" in
+            /*|..|../*|*/../*)
+              echo "::error::IBM_CE_SOURCE_DIR must be a repository-relative path without '..'."
+              exit 1
+              ;;
+          esac
+
+          if [[ ! -d "$IBM_CE_SOURCE_DIR" ]]; then
+            echo "::error::Source directory '$IBM_CE_SOURCE_DIR' does not exist in this repository."
+            exit 1
+          fi
+          workspace_real="$(realpath "$GITHUB_WORKSPACE")"
+          source_real="$(realpath "$IBM_CE_SOURCE_DIR")"
+          case "$source_real/" in
+            "$workspace_real/"*) ;;
+            *)
+              echo "::error::IBM_CE_SOURCE_DIR must resolve to a directory inside the repository."
+              exit 1
+              ;;
+          esac
+          if [[ ! -f "$source_real/package.json" ]]; then
+            echo "::error::No package.json found in '$IBM_CE_SOURCE_DIR'. Add the Node.js service source or set IBM_CE_SOURCE_DIR to its repository-relative directory."
+            exit 1
+          fi
+
+          case "$IBM_CE_VISIBILITY" in
+            public|private|project) ;;
+            *)
+              echo "::error::IBM_CE_VISIBILITY must be set to public, private, or project."
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$IBM_CE_PORT" ]]; then
+            if [[ ! "$IBM_CE_PORT" =~ ^[0-9]{1,5}$ ]]; then
+              echo "::error::IBM_CE_PORT must be a valid TCP port number."
+              exit 1
+            fi
+            port_value=$((10#$IBM_CE_PORT))
+            if (( port_value < 1 || port_value > 65535 )); then
+              echo "::error::IBM_CE_PORT must be between 1 and 65535."
+              exit 1
+            fi
+          fi
+
+          if [[ "$IBM_CE_HEALTH_PATH" != /* || "$IBM_CE_HEALTH_PATH" == *$'\n'* ]]; then
+            echo "::error::IBM_CE_HEALTH_PATH must be a single-line path beginning with '/'."
+            exit 1
+          fi
+
+      - name: Authenticate to IBM Cloud and install Code Engine CLI
+        uses: IBM/actions-ibmcloud-cli@b6c3722d26c40919522f82aeeae3f4948793ef50 # pinned IBM CLI action
+        with:
+          api_key: ${{ secrets.IBM_CLOUD_API_KEY }}
+          region: ${{ vars.IBM_CE_REGION }}
+          group: ${{ vars.IBM_CE_RESOURCE_GROUP }}
+          plugins: code-engine
+
+      - name: Select the existing Code Engine project
+        env:
+          IBM_CE_PROJECT: ${{ vars.IBM_CE_PROJECT }}
+        run: ibmcloud ce project select --name "$IBM_CE_PROJECT"
+
+      - name: Create or update backend application
+        env:
+          IBM_CE_APP_NAME: bigkain-ibm-backend
+          IBM_CE_SOURCE_DIR: ${{ vars.IBM_CE_SOURCE_DIR || '.' }}
+          IBM_CE_PORT: ${{ vars.IBM_CE_PORT }}
+          IBM_CE_VISIBILITY: ${{ vars.IBM_CE_VISIBILITY }}
+        run: |
+          set -euo pipefail
+
+          app_args=(
+            --name "$IBM_CE_APP_NAME"
+            --build-source "$IBM_CE_SOURCE_DIR"
+            --build-strategy buildpacks
+            --visibility "$IBM_CE_VISIBILITY"
+            --wait
+            --wait-timeout 600
+          )
+          if [[ -n "$IBM_CE_PORT" ]]; then
+            app_args+=(--port "$IBM_CE_PORT")
+          fi
+
+          if ibmcloud ce app get --name "$IBM_CE_APP_NAME" >/dev/null 2>&1; then
+            ibmcloud ce app update "${app_args[@]}"
+          else
+            ibmcloud ce app create "${app_args[@]}"
+          fi
+
+      - name: Verify Code Engine app health
+        env:
+          IBM_CE_HEALTH_PATH: ${{ vars.IBM_CE_HEALTH_PATH || '/' }}
+          IBM_CE_APP_NAME: bigkain-ibm-backend
+        run: |
+          set -euo pipefail
+
+          app_url="$(ibmcloud ce app get --name "$IBM_CE_APP_NAME" --output url)"
+          if [[ -z "$app_url" || "$app_url" != https://* ]]; then
+            echo "::error::Code Engine did not return an HTTPS URL for '$IBM_CE_APP_NAME'."
+            exit 1
+          fi
+          health_url="${app_url%/}${IBM_CE_HEALTH_PATH}"
+          echo "Checking $health_url"
+
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error --max-time 10 --output /dev/null "$health_url"; then
+              echo "Health check passed."
+              exit 0
+            fi
+            if [[ "$attempt" -lt 18 ]]; then
+              echo "Health endpoint not ready (attempt $attempt/18); retrying in 10 seconds."
+              sleep 10
+            fi
+          done
+
+          echo "::error::Health check failed after 18 attempts. Check the Code Engine app and health path."
+          exit 1
